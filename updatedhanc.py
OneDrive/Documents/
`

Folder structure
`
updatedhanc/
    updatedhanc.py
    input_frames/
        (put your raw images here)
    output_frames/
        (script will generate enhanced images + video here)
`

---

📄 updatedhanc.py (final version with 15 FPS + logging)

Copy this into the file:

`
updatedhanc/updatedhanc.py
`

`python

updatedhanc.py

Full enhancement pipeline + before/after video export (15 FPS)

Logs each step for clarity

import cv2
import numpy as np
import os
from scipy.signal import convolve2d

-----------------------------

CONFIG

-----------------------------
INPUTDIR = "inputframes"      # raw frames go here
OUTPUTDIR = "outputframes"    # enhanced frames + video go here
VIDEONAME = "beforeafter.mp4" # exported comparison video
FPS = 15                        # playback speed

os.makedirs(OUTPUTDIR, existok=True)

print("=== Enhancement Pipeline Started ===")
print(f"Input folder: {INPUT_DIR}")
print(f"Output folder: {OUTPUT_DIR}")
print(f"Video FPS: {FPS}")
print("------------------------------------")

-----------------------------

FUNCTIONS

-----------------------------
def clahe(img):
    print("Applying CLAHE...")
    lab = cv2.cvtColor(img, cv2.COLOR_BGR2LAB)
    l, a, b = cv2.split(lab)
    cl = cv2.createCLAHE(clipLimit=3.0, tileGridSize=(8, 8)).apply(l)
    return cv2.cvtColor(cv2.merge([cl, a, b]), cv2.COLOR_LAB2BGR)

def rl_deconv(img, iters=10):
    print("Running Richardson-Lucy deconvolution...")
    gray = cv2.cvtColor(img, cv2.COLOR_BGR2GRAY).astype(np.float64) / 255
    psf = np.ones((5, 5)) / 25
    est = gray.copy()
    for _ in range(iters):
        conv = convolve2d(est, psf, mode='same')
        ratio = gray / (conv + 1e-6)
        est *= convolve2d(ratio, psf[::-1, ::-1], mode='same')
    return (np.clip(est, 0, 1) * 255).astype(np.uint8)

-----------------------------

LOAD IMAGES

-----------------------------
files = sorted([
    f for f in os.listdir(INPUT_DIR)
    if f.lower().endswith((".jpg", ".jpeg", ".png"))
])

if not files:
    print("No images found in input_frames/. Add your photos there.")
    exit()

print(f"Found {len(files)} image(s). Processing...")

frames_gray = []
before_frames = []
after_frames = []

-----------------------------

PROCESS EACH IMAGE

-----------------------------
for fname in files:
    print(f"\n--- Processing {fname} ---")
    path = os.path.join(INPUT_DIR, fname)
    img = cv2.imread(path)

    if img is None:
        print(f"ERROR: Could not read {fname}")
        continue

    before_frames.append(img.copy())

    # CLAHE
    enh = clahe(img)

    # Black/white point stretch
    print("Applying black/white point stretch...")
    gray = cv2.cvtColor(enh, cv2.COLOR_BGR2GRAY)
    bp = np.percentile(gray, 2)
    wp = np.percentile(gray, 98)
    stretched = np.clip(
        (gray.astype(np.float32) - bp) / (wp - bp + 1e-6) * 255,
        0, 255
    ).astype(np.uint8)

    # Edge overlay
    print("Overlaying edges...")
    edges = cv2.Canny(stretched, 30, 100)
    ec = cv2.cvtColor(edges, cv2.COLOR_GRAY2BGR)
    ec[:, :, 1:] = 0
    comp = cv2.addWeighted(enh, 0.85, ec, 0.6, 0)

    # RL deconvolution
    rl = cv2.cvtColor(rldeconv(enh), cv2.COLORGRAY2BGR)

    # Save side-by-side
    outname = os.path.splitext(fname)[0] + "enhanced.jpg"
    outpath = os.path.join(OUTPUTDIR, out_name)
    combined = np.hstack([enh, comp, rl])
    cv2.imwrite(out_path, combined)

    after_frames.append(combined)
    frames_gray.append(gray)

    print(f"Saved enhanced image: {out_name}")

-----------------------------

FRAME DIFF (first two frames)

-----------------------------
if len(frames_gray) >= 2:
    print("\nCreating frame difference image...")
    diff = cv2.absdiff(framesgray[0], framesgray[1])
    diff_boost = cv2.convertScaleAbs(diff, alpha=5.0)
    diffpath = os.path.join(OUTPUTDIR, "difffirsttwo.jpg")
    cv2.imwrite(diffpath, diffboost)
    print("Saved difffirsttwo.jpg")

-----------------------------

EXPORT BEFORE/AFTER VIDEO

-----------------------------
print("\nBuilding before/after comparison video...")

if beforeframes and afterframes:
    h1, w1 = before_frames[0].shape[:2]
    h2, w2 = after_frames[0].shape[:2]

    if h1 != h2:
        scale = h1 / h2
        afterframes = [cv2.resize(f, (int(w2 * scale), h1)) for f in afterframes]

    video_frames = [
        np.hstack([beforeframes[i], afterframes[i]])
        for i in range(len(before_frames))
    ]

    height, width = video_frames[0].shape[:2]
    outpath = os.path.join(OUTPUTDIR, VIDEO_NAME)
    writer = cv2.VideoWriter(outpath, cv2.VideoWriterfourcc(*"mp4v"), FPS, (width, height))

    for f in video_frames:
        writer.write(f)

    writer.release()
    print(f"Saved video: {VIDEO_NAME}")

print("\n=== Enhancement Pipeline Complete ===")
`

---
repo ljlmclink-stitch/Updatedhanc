@@ -1,0 +1,152 @@
+# updatedhanc.py
+# Full enhancement pipeline + before/after video export (15 FPS)
+# Logs each step for clarity
+
+import cv2
+import numpy as np
+import os
+from scipy.signal import convolve2d
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+INPUT_DIR = "input_frames"      # raw frames go here
+OUTPUT_DIR = "output_frames"    # enhanced frames + video go here
+VIDEO_NAME = "before_after.mp4" # exported comparison video
+FPS = 15                        # playback speed
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print("=== Enhancement Pipeline Started ===")
+print(f"Input folder: {INPUT_DIR}")
+print(f"Output folder: {OUTPUT_DIR}")
+print(f"Video FPS: {FPS}")
+print("------------------------------------")
+
+# -----------------------------
+# FUNCTIONS
+# -----------------------------
+def clahe(img):
+    print("Applying CLAHE...")
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    cl = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(l)
+    return cv2.cvtColor(cv2.merge([cl, a, b]), cv2.COLOR_LAB2BGR)
+
+def rl_deconv(img, iters=10):
+    print("Running Richardson-Lucy deconvolution...")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float64) / 255
+    psf = np.ones((5, 5)) / 25
+    est = gray.copy()
+    for _ in range(iters):
+        conv = convolve2d(est, psf, mode='same')
+        ratio = gray / (conv + 1e-6)
+        est *= convolve2d(ratio, psf[::-1, ::-1], mode='same')
+    return (np.clip(est, 0, 1) * 255).astype(np.uint8)
+
+# -----------------------------
+# LOAD IMAGES
+# -----------------------------
+files = sorted([
+    f for f in os.listdir(INPUT_DIR)
+    if f.lower().endswith((".jpg", ".jpeg", ".png"))
+])
+
+if not files:
+    print("No images found in input_frames/. Add your photos there.")
+    exit()
+
+print(f"Found {len(files)} image(s). Processing...")
+
+frames_gray = []
+before_frames = []
+after_frames = []
+
+# -----------------------------
+# PROCESS EACH IMAGE
+# -----------------------------
+for fname in files:
+    print(f"\n--- Processing {fname} ---")
+    path = os.path.join(INPUT_DIR, fname)
+    img = cv2.imread(path)
+
+    if img is None:
+        print(f"ERROR: Could not read {fname}")
+        continue
+
+    before_frames.append(img.copy())
+
+    # CLAHE
+    enh = clahe(img)
+
+    # Black/white point stretch
+    print("Applying black/white point stretch...")
+    gray = cv2.cvtColor(enh, cv2.COLOR_BGR2GRAY)
+    bp = np.percentile(gray, 2)
+    wp = np.percentile(gray, 98)
+    stretched = np.clip(
+        (gray.astype(np.float32) - bp) / (wp - bp + 1e-6) * 255,
+        0, 255
+    ).astype(np.uint8)
+
+    # Edge overlay
+    print("Overlaying edges...")
+    edges = cv2.Canny(stretched, 30, 100)
+    ec = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+    ec[:, :, 1:] = 0
+    comp = cv2.addWeighted(enh, 0.85, ec, 0.6, 0)
+
+    # RL deconvolution
+    rl = cv2.cvtColor(rl_deconv(enh), cv2.COLOR_GRAY2BGR)
+
+    # Save side-by-side
+    out_name = os.path.splitext(fname)[0] + "_enhanced.jpg"
+    out_path = os.path.join(OUTPUT_DIR, out_name)
+    combined = np.hstack([enh, comp, rl])
+    cv2.imwrite(out_path, combined)
+
+    after_frames.append(combined)
+    frames_gray.append(gray)
+
+    print(f"Saved enhanced image: {out_name}")
+
+# -----------------------------
+# FRAME DIFF (first two frames)
+# -----------------------------
+if len(frames_gray) >= 2:
+    print("\nCreating frame difference image...")
+    diff = cv2.absdiff(frames_gray[0], frames_gray[1])
+    diff_boost = cv2.convertScaleAbs(diff, alpha=5.0)
+    diff_path = os.path.join(OUTPUT_DIR, "diff_first_two.jpg")
+    cv2.imwrite(diff_path, diff_boost)
+    print("Saved diff_first_two.jpg")
+
+# -----------------------------
+# EXPORT BEFORE/AFTER VIDEO
+# -----------------------------
+print("\nBuilding before/after comparison video...")
+
+if before_frames and after_frames:
+    h1, w1 = before_frames[0].shape[:2]
+    h2, w2 = after_frames[0].shape[:2]
+
+    if h1 != h2:
+        scale = h1 / h2
+        after_frames = [cv2.resize(f, (int(w2 * scale), h1)) for f in after_frames]
+
+    video_frames = [
+        np.hstack([before_frames[i], after_frames[i]])
+        for i in range(len(before_frames))
+    ]
+
+    height, width = video_frames[0].shape[:2]
+    out_path = os.path.join(OUTPUT_DIR, VIDEO_NAME)
+    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (width, height))
+
+    for f in video_frames:
+        writer.write(f)
+
+    writer.release()
+    print(f"Saved video: {VIDEO_NAME}")
+
+print("\n=== Enhancement Pipeline Complete ===")
